@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Improved 3D Magnetic Field Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background: #020617;
+            color: white;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        #ui {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(15, 23, 42, 0.85);
+            padding: 20px;
+            border-radius: 12px;
+            backdrop-filter: blur(8px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            width: 260px;
+            pointer-events: auto;
+        }
+        h3 { margin-top: 0; color: #38bdf8; font-size: 1.1rem; }
+        .control-group { margin-bottom: 15px; }
+        label { font-size: 0.9rem; color: #94a3b8; }
+        input[type="range"] { width: 100%; cursor: pointer; }
+        button {
+            width: 100%;
+            padding: 10px;
+            background: #38bdf8;
+            border: none;
+            border-radius: 6px;
+            color: #020617;
+            font-weight: bold;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        button:hover { background: #7dd3fc; }
+        .meter-container { margin-top: 20px; }
+        .meter {
+            width: 100%;
+            height: 8px;
+            background: #1e293b;
+            border-radius: 4px;
+            margin: 8px 0;
+            overflow: hidden;
+        }
+        .fill {
+            height: 100%;
+            background: linear-gradient(90deg, #38bdf8, #818cf8);
+            width: 0%;
+            transition: width 0.3s ease-out;
+        }
+        .stats { font-family: monospace; font-size: 0.85rem; color: #cbd5e1; }
+        .legend { font-size: 0.75rem; margin-top: 10px; color: #64748b; }
+    </style>
+</head>
+<body>
+
+<div id="ui">
+    <h3>Electromagnetism Viz</h3>
+    
+    <div class="control-group">
+        <label>Current (I): <span id="Ival">5</span> A</label>
+        <input type="range" min="1" max="20" step="0.5" value="5" id="current">
+    </div>
+
+    <button id="dirBtn">Current: Upward ↑</button>
+
+    <div class="meter-container">
+        <label>Field Strength (at 1m)</label>
+        <div class="meter"><div class="fill" id="fill"></div></div>
+        <div class="stats" id="Btext">B = 0 T</div>
+    </div>
+
+    <div class="legend">
+        Right-Hand Rule: Thumb points to current, fingers curl to field (B).
+    </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+<script>
+/**
+ * IMPROVEMENTS MADE:
+ * 1. Memory Management: Properly disposing geometries/materials.
+ * 2. Visual Physics: Field brightness decreases with 1/r.
+ * 3. Directionality: Added ArrowHelpers and animated dashed lines.
+ * 4. Scale: B field calculated dynamically based on distance.
+ */
+
+let scene, camera, renderer, controls;
+let fieldGroup = new THREE.Group();
+let currentI = 5;
+let currentDirection = 1; // 1 for Up, -1 for Down
+const mu0 = 4 * Math.PI * 1e-7;
+
+function init() {
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x020617);
+
+    camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(10, 8, 10);
+
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    document.body.appendChild(renderer.domElement);
+
+    controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+
+    // Lighting
+    const ambient = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambient);
+    const pointLight = new THREE.PointLight(0xffffff, 1);
+    pointLight.position.set(5, 10, 5);
+    scene.add(pointLight);
+
+    // The Wire
+    const wireGeom = new THREE.CylinderGeometry(0.08, 0.08, 12, 32);
+    const wireMat = new THREE.MeshStandardMaterial({ color: 0xfacc15, metalness: 0.5, roughness: 0.2 });
+    const wire = new THREE.Mesh(wireGeom, wireMat);
+    scene.add(wire);
+
+    // Current Arrow (on the wire)
+    const arrowHelper = new THREE.ArrowHelper(
+        new THREE.Vector3(0, 1, 0), 
+        new THREE.Vector3(0, -2, 0), 
+        4, 0xfacc15, 0.5, 0.3
+    );
+    arrowHelper.name = "currentArrow";
+    scene.add(arrowHelper);
+
+    scene.add(fieldGroup);
+
+    createFieldLines();
+    animate();
+}
+
+function createFieldLines() {
+    // 1. Clean up old objects to prevent memory leaks
+    while(fieldGroup.children.length > 0){ 
+        const obj = fieldGroup.children[0];
+        if(obj.geometry) obj.geometry.dispose();
+        if(obj.material) obj.material.dispose();
+        fieldGroup.remove(obj); 
+    }
+
+    // 2. Create concentric rings
+    // B = (mu0 * I) / (2 * pi * r)
+    for (let r = 1.5; r <= 6; r += 1.2) {
+        const curve = new THREE.EllipseCurve(0, 0, r, r, 0, 2 * Math.PI, false);
+        const points = curve.getPoints(100).map(p => new THREE.Vector3(p.x, 0, p.y));
+        const geometry = new THREE.BufferGeometry().setFromPoints(points);
+        
+        // Visual intensity: Closer lines are brighter
+        const intensity = 1.5 / r; 
+        const color = new THREE.Color(0x38bdf8).multiplyScalar(intensity);
+
+        // Dashed material for flow animation
+        const material = new THREE.LineDashedMaterial({
+            color: color,
+            dashSize: 0.4,
+            gapSize: 0.2,
+        });
+
+        const line = new THREE.Line(geometry, material);
+        line.computeLineDistances();
+        fieldGroup.add(line);
+
+        // 3. Add directional arrows on each ring
+        const arrowCount = 4;
+        for (let i = 0; i < arrowCount; i++) {
+            const angle = (i / arrowCount) * Math.PI * 2;
+            const pos = new THREE.Vector3(Math.cos(angle) * r, 0, Math.sin(angle) * r);
+            
+            // Tangent direction for arrow
+            // For Upward current (currentDirection=1), field is CCW (top down view)
+            const dir = new THREE.Vector3(-Math.sin(angle), 0, Math.cos(angle)).multiplyScalar(currentDirection);
+            
+            const arrow = new THREE.ArrowHelper(dir, pos, 0.4, color, 0.2, 0.15);
+            fieldGroup.add(arrow);
+        }
+    }
+}
+
+// UI Listeners
+document.getElementById("current").oninput = (e) => {
+    currentI = parseFloat(e.target.value);
+    document.getElementById("Ival").innerText = currentI;
+};
+
+document.getElementById("dirBtn").onclick = () => {
+    currentDirection *= -1;
+    document.getElementById("dirBtn").innerText = 
+        currentDirection > 0 ? "Current: Upward ↑" : "Current: Downward ↓";
+    
+    // Update wire arrow
+    const arrow = scene.getObjectByName("currentArrow");
+    arrow.setDirection(new THREE.Vector3(0, currentDirection, 0));
+    arrow.position.y = currentDirection > 0 ? -2 : 2;
+
+    createFieldLines();
+};
+
+function animate() {
+    requestAnimationFrame(animate);
+    controls.update();
+
+    // Animate the flow of dashes
+    fieldGroup.children.forEach(child => {
+        if (child instanceof THREE.Line) {
+            // Move dashes in the direction of the field
+            child.material.dashOffset -= 0.01 * currentDirection;
+        }
+    });
+
+    // Update Physics Text
+    // B at 1 meter for the progress bar
+    const r_test = 1.0; 
+    const B = (mu0 * currentI) / (2 * Math.PI * r_test);
+    
+    document.getElementById("Btext").innerText = `B = ${B.toExponential(2)} T (at 1m)`;
+    
+    // UI Progress Bar (Maxed at 20A / 1m = 4e-6 T)
+    const maxB = 4e-6;
+    const percent = (B / maxB) * 100;
+    document.getElementById("fill").style.width = Math.min(percent, 100) + "%";
+
+    renderer.render(scene, camera);
+}
+
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+window.onload = init;
+</script>
+</body>
+</html>
+
